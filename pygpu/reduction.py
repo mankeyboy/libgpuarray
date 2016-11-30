@@ -1,12 +1,25 @@
 import math
+import re
 
 from mako.template import Template
 
 import numpy
 
 from . import gpuarray
-from .tools import ArrayArg, check_args, prod, lru_cache
-from .elemwise import parse_c_args, massage_op
+from .tools import ScalarArg, ArrayArg, check_args, prod, lru_cache
+from .dtypes import parse_c_arg_backend
+
+
+def parse_c_args(arguments):
+    return tuple(parse_c_arg_backend(arg, ScalarArg, ArrayArg)
+                 for arg in arguments.split(','))
+
+
+INDEX_RE = re.compile('([a-zA-Z_][a-zA-Z0-9_]*)\[i\]')
+
+
+def massage_op(operation):
+    return INDEX_RE.sub('\g<1>[0]', operation)
 
 
 def _ceil_log2(x):
@@ -222,12 +235,15 @@ class ReductionKernel(object):
         return self._find_kernel_ls(self._gen_basic, maxls, nd)
 
     def __call__(self, *args, **kwargs):
-        _, nd, dims, strs, offsets = check_args(args, collapse=False,
-                                                broadcast=False)
+        broadcast = kwargs.pop('broadcast', None)
         out = kwargs.pop('out', None)
         if len(kwargs) != 0:
             raise TypeError('Unexpected keyword argument: %s' %
                             kwargs.keys()[0])
+
+        _, nd, dims, strs, offsets = check_args(args, collapse=False,
+                                                broadcast=broadcast)
+
         n = prod(dims)
         out_shape = tuple(d for i, d in enumerate(dims) if not self.redux[i])
         gs = prod(out_shape)
@@ -235,7 +251,7 @@ class ReductionKernel(object):
             gs = 1
         n /= gs
         if gs > self.context.maxgsize:
-            raise ValueError("Array to big to be reduced along the "
+            raise ValueError("Array too big to be reduced along the "
                              "selected axes")
 
         if out is None:

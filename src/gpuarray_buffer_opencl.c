@@ -12,6 +12,9 @@
 #include <string.h>
 #include <limits.h>
 
+#include "loaders/libclblas.h"
+#include "loaders/libclblast.h"
+
 #ifdef _MSC_VER
 #define strdup _strdup
 #endif
@@ -24,11 +27,68 @@ static cl_int err;
 #define FAIL(v, e) { if (ret) *ret = e; return v; }
 #define CHKFAIL(v) if (err != CL_SUCCESS) FAIL(v, GA_IMPL_ERROR)
 
-static int cl_property(void *c, gpudata *b, gpukernel *k, int p, void *r);
-static gpudata *cl_alloc(void *c, size_t size, void *data, int flags,
+
+GPUARRAY_LOCAL const gpuarray_buffer_ops opencl_ops;
+
+static int cl_property(gpucontext *c, gpudata *b, gpukernel *k, int p, void *r);
+static gpudata *cl_alloc(gpucontext *c, size_t size, void *data, int flags,
                          int *ret);
 static void cl_release(gpudata *b);
 static void cl_free_ctx(cl_ctx *ctx);
+static gpukernel *cl_newkernel(gpucontext *ctx, unsigned int count,
+                               const char **strings, const size_t *lengths,
+                               const char *fname, unsigned int argcount,
+                               const int *types, int flags, int *ret,
+                               char **err_str);
+static const char CL_CONTEXT_PREAMBLE[] =
+"#define GA_WARP_SIZE %lu\n";  // to be filled by cl_make_ctx()
+
+static int setup_done = 0;
+static int setup_lib(void) {
+  if (setup_done)
+    return GA_NO_ERROR;
+  GA_CHECK(load_libopencl());
+  setup_done = 1;
+  return GA_NO_ERROR;
+}
+
+static int cl_get_platform_count(unsigned int* platcount) {
+  cl_uint nump;
+
+  GA_CHECK(setup_lib());
+  err = clGetPlatformIDs(0, NULL, &nump);
+  if (err != CL_SUCCESS)
+    return GA_IMPL_ERROR;
+  *platcount = (unsigned int)nump;
+  return GA_NO_ERROR;
+}
+
+static int cl_get_device_count(unsigned int platform, unsigned int* devcount) {
+  cl_platform_id *ps;
+  cl_platform_id p;
+  cl_uint numd;
+  unsigned int platcount;
+
+  /* This will load the library if needed */
+  GA_CHECK(cl_get_platform_count(&platcount));
+
+  ps = calloc(sizeof(*ps), platcount);
+  if (ps == NULL)
+    return GA_MEMORY_ERROR;
+  err = clGetPlatformIDs(platcount, ps, NULL);
+  if (err != CL_SUCCESS) {
+    free(ps);
+    return GA_IMPL_ERROR;
+  }
+  p = ps[platform];
+
+  err = clGetDeviceIDs(p, CL_DEVICE_TYPE_ALL, 0, NULL, &numd);
+  free(ps);
+  if (err != CL_SUCCESS)
+    return GA_IMPL_ERROR;
+  *devcount = (unsigned int)numd;
+  return GA_NO_ERROR;
+}
 
 static cl_device_id get_dev(cl_context ctx, int *ret) {
   size_t sz;
@@ -49,7 +109,7 @@ static cl_device_id get_dev(cl_context ctx, int *ret) {
   return res;
 }
 
-cl_ctx *cl_make_ctx(cl_context ctx) {
+cl_ctx *cl_make_ctx(cl_context ctx, int flags) {
   cl_ctx *res;
   cl_device_id id;
   cl_command_queue_properties qprop;
@@ -59,7 +119,16 @@ cl_ctx *cl_make_ctx(cl_context ctx) {
   size_t len;
   int64_t v = 0;
   int e = 0;
+  size_t warp_size;
+  int ret;
+  const char dummy_kern[] = "__kernel void kdummy(float f) {}\n";
+  strb context_preamble = STRB_STATIC_INIT;
+  const char *rlk[1];
+  gpukernel *m;
 
+  e = setup_lib();
+  if (e != GA_NO_ERROR)
+    return NULL;
   id = get_dev(ctx, NULL);
   if (id == NULL) return NULL;
   err = clGetDeviceInfo(id, CL_DEVICE_QUEUE_PROPERTIES, sizeof(qprop),
@@ -82,13 +151,16 @@ cl_ctx *cl_make_ctx(cl_context ctx) {
   if (res == NULL) return NULL;
 
   res->ctx = ctx;
+  res->ops = &opencl_ops;
   res->err = CL_SUCCESS;
   res->refcnt = 1;
   res->exts = NULL;
   res->blas_handle = NULL;
-  res->q = clCreateCommandQueue(ctx, id,
-				qprop&CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE,
-				&err);
+  res->preamble = NULL;
+  res->q = clCreateCommandQueue(
+    ctx, id,
+    ISSET(flags, GA_CTX_SINGLE_STREAM) ? 0 : qprop&CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE,
+    &err);
   if (res->q == NULL) {
     free(res);
     return NULL;
@@ -101,22 +173,40 @@ cl_ctx *cl_make_ctx(cl_context ctx) {
 
   clRetainContext(res->ctx);
   TAG_CTX(res);
-  res->errbuf = cl_alloc(res, 8, &v, GA_BUFFER_INIT, &e);
+  res->errbuf = cl_alloc((gpucontext *)res, 8, &v, GA_BUFFER_INIT, &e);
   if (e != GA_NO_ERROR) {
-    err = res->err;
-    cl_free_ctx(res);
-    return NULL;
+    goto fail;
   }
   res->refcnt--; /* Prevent ref loop */
+
+  /* Create per-context OpenCL preamble */
+
+  // Create a dummy kernel and check GA_KERNEL_PROP_PREFLSIZE
+  rlk[0] = dummy_kern;
+  len = sizeof(dummy_kern);
+  // this dummy kernel does not require a CLUDA preamble
+  m = cl_newkernel((gpucontext *)res, 1, rlk, &len, "kdummy", 0, NULL, 0, &ret, NULL);
+  if (m == NULL)
+    goto fail;
+  ret = cl_property((gpucontext *)res, NULL, m, GA_KERNEL_PROP_PREFLSIZE, &warp_size);
+  if (ret != GA_NO_ERROR)
+    goto fail;
+
+  // Write the preferred workgroup multiple as GA_WARP_SIZE in preamble
+  strb_appendf(&context_preamble, CL_CONTEXT_PREAMBLE, (unsigned long)warp_size);
+  res->preamble = strb_cstr(&context_preamble);
+  if (res->preamble == NULL)
+    goto fail;
+
   return res;
+
+fail:
+  err = res->err;
+  cl_free_ctx(res);
+  return NULL;
 }
 
-cl_context cl_get_ctx(void *ctx) {
-  ASSERT_CTX((cl_ctx *)ctx);
-  return ((cl_ctx *)ctx)->ctx;
-}
-
-cl_command_queue cl_get_stream(void *ctx) {
+cl_command_queue cl_get_stream(gpucontext *ctx) {
   ASSERT_CTX((cl_ctx *)ctx);
   return ((cl_ctx *)ctx)->q;
 }
@@ -129,8 +219,8 @@ static void cl_free_ctx(cl_ctx *ctx) {
   ctx->refcnt--;
   if (ctx->refcnt == 0) {
     if (ctx->blas_handle != NULL) {
-      ctx->err = cl_property(ctx, NULL, NULL, GA_CTX_PROP_BLAS_OPS, &blas_ops);
-      blas_ops->teardown(ctx);
+      ctx->err = cl_property((gpucontext *)ctx, NULL, NULL, GA_CTX_PROP_BLAS_OPS, &blas_ops);
+      blas_ops->teardown((gpucontext *)ctx);
     }
     if (ctx->errbuf != NULL) {
       ctx->refcnt = 2; /* Avoid recursive release */
@@ -138,12 +228,14 @@ static void cl_free_ctx(cl_ctx *ctx) {
     }
     clReleaseCommandQueue(ctx->q);
     clReleaseContext(ctx->ctx);
+    if (ctx->preamble != NULL)
+      free(ctx->preamble);
     CLEAR(ctx);
     free(ctx);
   }
 }
 
-gpudata *cl_make_buf(void *c, cl_mem buf) {
+gpudata *cl_make_buf(gpucontext *c, cl_mem buf) {
   cl_ctx *ctx = (cl_ctx *)c;
   gpudata *res;
   cl_context buf_ctx;
@@ -180,11 +272,6 @@ cl_mem cl_get_buf(gpudata *g) { ASSERT_BUF(g); return g->buf; }
 #define CL_DOUBLE "cl_khr_fp64"
 #define CL_HALF "cl_khr_fp16"
 
-static gpukernel *cl_newkernel(void *ctx, unsigned int count,
-                               const char **strings, const size_t *lengths,
-                               const char *fname, unsigned int argcount,
-                               const int *types, int flags, int *ret,
-                               char **err_str);
 static void cl_releasekernel(gpukernel *k);
 static int cl_callkernel(gpukernel *k, unsigned int n,
                          const size_t *bs, const size_t *gs,
@@ -198,6 +285,9 @@ static const char CL_PREAMBLE[] =
   "#define LOCAL_MEM __local\n"
   "#define LOCAL_MEM_ARG __local\n"
   "#define REQD_WG_SIZE(x, y, z) __attribute__((reqd_work_group_size(x, y, z)))\n"
+  "#ifndef NULL\n"
+  "  #define NULL ((void*)0)\n"
+  "#endif\n"
   "#define LID_0 get_local_id(0)\n"
   "#define LID_1 get_local_id(1)\n"
   "#define LID_2 get_local_id(2)\n"
@@ -223,7 +313,12 @@ static const char CL_PREAMBLE[] =
   "#define ga_double double\n"
   "#define ga_half half\n"
   "#define ga_size ulong\n"
-  "#define ga_ssize long\n";
+  "#define ga_ssize long\n"
+  "#define load_half(p) vload_half(0, p)\n"
+  "#define store_half(p, v) vstore_half_rtn(v, 0, p)\n"
+  "#define GA_DECL_SHARED_PARAM(type, name) , __local type name[]\n"
+  "#define GA_DECL_SHARED_BODY(type, name)\n";
+
 /* XXX: add complex types, quad types, and longlong */
 /* XXX: add vector types */
 
@@ -243,10 +338,8 @@ static const char *get_error_string(cl_int err) {
   case CL_IMAGE_FORMAT_NOT_SUPPORTED:     return "Image format not supported";
   case CL_BUILD_PROGRAM_FAILURE:          return "Program build failure";
   case CL_MAP_FAILURE:                    return "Map failure";
-#ifdef CL_VERSION_1_1
   case CL_MISALIGNED_SUB_BUFFER_OFFSET:   return "Buffer offset improperly aligned";
   case CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST: return "Event in wait list has an error status";
-#endif
   case CL_INVALID_VALUE:                  return "Invalid value";
   case CL_INVALID_DEVICE_TYPE:            return "Invalid device type";
   case CL_INVALID_PLATFORM:               return "Invalid platform";
@@ -281,9 +374,7 @@ static const char *get_error_string(cl_int err) {
   case CL_INVALID_BUFFER_SIZE:            return "Invalid buffer size";
   case CL_INVALID_MIP_LEVEL:              return "Invalid mip-map level";
   case CL_INVALID_GLOBAL_WORK_SIZE:       return "Invalid global work size";
-#ifdef CL_VERSION_1_1
   case CL_INVALID_PROPERTY:               return "Invalid property";
-#endif
   default: return "Unknown error";
   }
 }
@@ -321,8 +412,7 @@ errcb(const char *errinfo, const void *pi, size_t cb, void *u) {
   fprintf(stderr, "%s\n", errinfo);
 }
 
-static void *cl_init(int devno, int flags, int *ret) {
-  int platno;
+static gpucontext *cl_init(int devno, int flags, int *ret) {
   cl_device_id *ds;
   cl_device_id d;
   cl_platform_id *ps;
@@ -334,9 +424,15 @@ static void *cl_init(int devno, int flags, int *ret) {
   };
   cl_context ctx;
   cl_ctx *res;
+  int platno;
+  int e;
 
   platno = devno >> 16;
   devno &= 0xFFFF;
+
+  e = setup_lib();
+  if (e != GA_NO_ERROR)
+    return NULL;
 
   err = clGetPlatformIDs(0, NULL, &nump);
   CHKFAIL(NULL);
@@ -368,18 +464,18 @@ static void *cl_init(int devno, int flags, int *ret) {
   ctx = clCreateContext(props, 1, &d, errcb, NULL, &err);
   CHKFAIL(NULL);
 
-  res = cl_make_ctx(ctx);
+  res = cl_make_ctx(ctx, flags);
   clReleaseContext(ctx);
   if (res == NULL) FAIL(NULL, GA_IMPL_ERROR);  // can also be a sys_error
-  return res;
+  return (gpucontext *)res;
 }
 
-static void cl_deinit(void *c) {
+static void cl_deinit(gpucontext *c) {
   ASSERT_CTX((cl_ctx *)c);
   cl_free_ctx((cl_ctx *)c);
 }
 
-static gpudata *cl_alloc(void *c, size_t size, void *data, int flags,
+static gpudata *cl_alloc(gpucontext *c, size_t size, void *data, int flags,
                          int *ret) {
   cl_ctx *ctx = (cl_ctx *)c;
   gpudata *res;
@@ -400,11 +496,13 @@ static gpudata *cl_alloc(void *c, size_t size, void *data, int flags,
 
   if (flags & GA_BUFFER_READ_ONLY) {
     if (flags & GA_BUFFER_WRITE_ONLY) FAIL(NULL, GA_VALUE_ERROR);
+    clflags &= ~CL_MEM_READ_WRITE;
     clflags |= CL_MEM_READ_ONLY;
   }
 
   if (flags & GA_BUFFER_WRITE_ONLY) {
     if (flags & GA_BUFFER_READ_ONLY) FAIL(NULL, GA_VALUE_ERROR);
+    clflags &= ~CL_MEM_READ_WRITE;
     clflags |= CL_MEM_WRITE_ONLY;
   }
 
@@ -450,27 +548,23 @@ static void cl_release(gpudata *b) {
 }
 
 static int cl_share(gpudata *a, gpudata *b, int *ret) {
-#ifdef CL_VERSION_1_1
   cl_ctx *ctx;
   cl_mem aa, bb;
-#endif
   ASSERT_BUF(a);
   ASSERT_BUF(b);
   if (a->buf == b->buf) return 1;
-#ifdef CL_VERSION_1_1
   if (a->ctx != b->ctx) return 0;
   ctx = a->ctx;
   ASSERT_CTX(ctx);
   ctx->err = clGetMemObjectInfo(a->buf, CL_MEM_ASSOCIATED_MEMOBJECT,
-				sizeof(aa), &aa, NULL);
+                                sizeof(aa), &aa, NULL);
   CHKFAIL(-1);
   ctx->err = clGetMemObjectInfo(b->buf, CL_MEM_ASSOCIATED_MEMOBJECT,
-				sizeof(bb), &bb, NULL);
+                                sizeof(bb), &bb, NULL);
   CHKFAIL(-1);
   if (aa == NULL) aa = a->buf;
   if (bb == NULL) bb = b->buf;
   if (aa == bb) return 1;
-#endif
   return 0;
 }
 
@@ -494,20 +588,20 @@ static int cl_move(gpudata *dst, size_t dstoff, gpudata *src, size_t srcoff,
 
   if (src->ev != NULL)
     evw[num_ev++] = src->ev;
-  if (dst->ev != NULL)
+  if (dst->ev != NULL && src != dst)
     evw[num_ev++] = dst->ev;
 
   if (num_ev > 0)
     evl = evw;
 
   ctx->err = clEnqueueCopyBuffer(ctx->q, src->buf, dst->buf, srcoff, dstoff,
-				 sz, num_ev, evl, &ev);
+                                 sz, num_ev, evl, &ev);
   if (ctx->err != CL_SUCCESS) {
     return GA_IMPL_ERROR;
   }
   if (src->ev != NULL)
     clReleaseEvent(src->ev);
-  if (dst->ev != NULL)
+  if (dst->ev != NULL && src != dst)
     clReleaseEvent(dst->ev);
 
   src->ev = ev;
@@ -535,7 +629,7 @@ static int cl_read(void *dst, gpudata *src, size_t srcoff, size_t sz) {
   }
 
   ctx->err = clEnqueueReadBuffer(ctx->q, src->buf, CL_TRUE, srcoff, sz, dst,
-				 num_ev, evl, NULL);
+                                 num_ev, evl, NULL);
   if (ctx->err != CL_SUCCESS) return GA_IMPL_ERROR;
   if (src->ev != NULL) clReleaseEvent(src->ev);
   src->ev = NULL;
@@ -561,7 +655,7 @@ static int cl_write(gpudata *dst, size_t dstoff, const void *src, size_t sz) {
   }
 
   ctx->err = clEnqueueWriteBuffer(ctx->q, dst->buf, CL_TRUE, dstoff, sz, src,
-				  num_ev, evl, NULL);
+                                  num_ev, evl, NULL);
   if (err != CL_SUCCESS) return GA_IMPL_ERROR;
   if (dst->ev != NULL) clReleaseEvent(dst->ev);
   dst->ev = NULL;
@@ -593,7 +687,7 @@ static int cl_memset(gpudata *dst, size_t offset, int data) {
   if (fl & CL_MEM_READ_ONLY) return GA_READONLY_ERROR;
 
   ctx->err = clGetMemObjectInfo(dst->buf, CL_MEM_SIZE, sizeof(bytes), &bytes,
-				NULL);
+                                NULL);
   if (ctx->err != CL_SUCCESS) return GA_IMPL_ERROR;
 
   bytes -= offset;
@@ -646,7 +740,7 @@ static int cl_memset(gpudata *dst, size_t offset, int data) {
   rlk[0] = local_kern;
   type = GA_BUFFER;
 
-  m = cl_newkernel(ctx, 1, rlk, &sz, "kmemset", 1, &type, 0, &res, NULL);
+  m = cl_newkernel((gpucontext *)ctx, 1, rlk, &sz, "kmemset", 1, &type, 0, &res, NULL);
   if (m == NULL) return res;
 
   /* Cheap kernel scheduling */
@@ -664,7 +758,11 @@ static int cl_memset(gpudata *dst, size_t offset, int data) {
 static int cl_check_extensions(const char **preamble, unsigned int *count,
                                int flags, cl_ctx *ctx) {
   if (flags & GA_USE_CLUDA) {
+    // add the common preamble
     preamble[*count] = CL_PREAMBLE;
+    (*count)++;
+    // add the per-context preamble
+    preamble[*count] = ctx->preamble;
     (*count)++;
   }
   if (flags & GA_USE_SMALL) {
@@ -680,18 +778,21 @@ static int cl_check_extensions(const char **preamble, unsigned int *count,
   if (flags & GA_USE_COMPLEX) {
     return GA_DEVSUP_ERROR; // for now
   }
+  // GA_USE_HALF should always work
+  /*
   if (flags & GA_USE_HALF) {
     if (check_ext(ctx, CL_HALF)) return GA_DEVSUP_ERROR;
     preamble[*count] = PRAGMA CL_HALF ENABLE;
     (*count)++;
   }
-  if (flags & (GA_USE_PTX|GA_USE_CUDA)) {
+  */
+  if (flags & GA_USE_CUDA) {
     return GA_DEVSUP_ERROR;
   }
   return GA_NO_ERROR;
 }
 
-static gpukernel *cl_newkernel(void *c, unsigned int count,
+static gpukernel *cl_newkernel(gpucontext *c, unsigned int count,
                                const char **strings, const size_t *lengths,
                                const char *fname, unsigned int argcount,
                                const int *types, int flags, int *ret,
@@ -702,11 +803,13 @@ static gpukernel *cl_newkernel(void *c, unsigned int count,
   cl_program p;
   // Sync this table size with the number of flags that can add stuff
   // at the beginning
-  const char *preamble[4];
+  const char *preamble[5];
   size_t *newl = NULL;
   const char **news = NULL;
   unsigned int n = 0;
   int error;
+  strb debug_msg = STRB_STATIC_INIT;
+  size_t log_size;
 
   ASSERT_CTX(ctx);
 
@@ -724,7 +827,6 @@ static gpukernel *cl_newkernel(void *c, unsigned int count,
       FAIL(NULL, GA_VALUE_ERROR);
     p = clCreateProgramWithBinary(ctx->ctx, 1, &dev, lengths, (const unsigned char **)strings, NULL, &ctx->err);
     if (ctx->err != CL_SUCCESS) {
-      clReleaseProgram(p);
       FAIL(NULL, GA_IMPL_ERROR);
     }
   } else {
@@ -769,15 +871,13 @@ static gpukernel *cl_newkernel(void *c, unsigned int count,
     if (ctx->err == CL_BUILD_PROGRAM_FAILURE && err_str!=NULL) {
       *err_str = NULL;  // Fallback, in case there's an error
 
-      strb debug_msg = STRB_STATIC_INIT;
       // We're substituting debug_msg for a string with this first line:
       strb_appends(&debug_msg, "Program build failure ::\n");
 
       // Determine the size of the log
-      size_t log_size;
       clGetProgramBuildInfo(p, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);
 
-      if(strb_ensure(&debug_msg, log_size)!=-1 && log_size>=1) { // Checks strb has enough space
+      if (strb_ensure(&debug_msg, log_size)!=-1 && log_size>=1) { // Checks strb has enough space
         // Get the log directly into the debug_msg
         clGetProgramBuildInfo(p, dev, CL_PROGRAM_BUILD_LOG, log_size, debug_msg.s+debug_msg.l, NULL);
         debug_msg.l += (log_size-1); // Back off to before final '\0'
@@ -819,6 +919,7 @@ static gpukernel *cl_newkernel(void *c, unsigned int count,
   res->argcount = argcount;
   res->k = clCreateKernel(p, fname, &ctx->err);
   res->types = NULL;  /* This avoids a crash in cl_releasekernel */
+  res->evr = NULL;   /* This avoids a crash in cl_releasekernel */
   res->ctx = ctx;
   ctx->refcnt++;
   clReleaseProgram(p);
@@ -833,6 +934,12 @@ static gpukernel *cl_newkernel(void *c, unsigned int count,
     FAIL(NULL, GA_IMPL_ERROR);
   }
   memcpy(res->types, types, argcount * sizeof(int));
+
+  res->evr = calloc(argcount, sizeof(cl_event *));
+  if (res->evr == NULL) {
+    cl_releasekernel(res);
+    FAIL(NULL, GA_IMPL_ERROR);
+  }
 
   return res;
 }
@@ -852,8 +959,42 @@ static void cl_releasekernel(gpukernel *k) {
     if (k->k) clReleaseKernel(k->k);
     cl_free_ctx(k->ctx);
     free(k->types);
+    free(k->evr);
     free(k);
   }
+}
+
+static int cl_setkernelarg(gpukernel *k, unsigned int i, void *a) {
+  cl_ctx *ctx = k->ctx;
+  gpudata *btmp;
+  cl_ulong temp;
+  cl_long stemp;
+  switch (k->types[i]) {
+  case GA_POINTER:
+    return GA_DEVSUP_ERROR;
+  case GA_BUFFER:
+    btmp = (gpudata *)a;
+    ctx->err = clSetKernelArg(k->k, i, sizeof(cl_mem), &btmp->buf);
+    k->evr[i] = &btmp->ev;
+    break;
+  case GA_SIZE:
+    temp = *((size_t *)a);
+    ctx->err = clSetKernelArg(k->k, i, gpuarray_get_elsize(GA_ULONG), &temp);
+    k->evr[i] = NULL;
+    break;
+  case GA_SSIZE:
+    stemp = *((ssize_t *)a);
+    ctx->err = clSetKernelArg(k->k, i, gpuarray_get_elsize(GA_LONG), &stemp);
+    k->evr[i] = NULL;
+    break;
+  default:
+    ctx->err = clSetKernelArg(k->k, i, gpuarray_get_elsize(k->types[i]), a);
+    k->evr[i] = NULL;
+  }
+  if (ctx->err != CL_SUCCESS) {
+    return GA_IMPL_ERROR;
+  }
+  return GA_NO_ERROR;
 }
 
 static int cl_callkernel(gpukernel *k, unsigned int n,
@@ -863,10 +1004,7 @@ static int cl_callkernel(gpukernel *k, unsigned int n,
   size_t _gs[3];
   cl_event ev;
   cl_event *evw;
-  gpudata *btmp;
   cl_device_id dev;
-  cl_ulong temp;
-  cl_long stemp;
   cl_uint num_ev;
   cl_uint i;
   int res = 0;
@@ -877,44 +1015,31 @@ static int cl_callkernel(gpukernel *k, unsigned int n,
   if (n > 3)
     return GA_VALUE_ERROR;
 
-  if (shared != 0)
-    return GA_UNSUPPORTED_ERROR;
-
   dev = get_dev(ctx->ctx, &res);
   if (dev == NULL) return res;
 
-  num_ev = 0;
+  if (args != NULL) {
+    for (i = 0; i < k->argcount; i++) {
+      err = cl_setkernelarg(k, i, args[i]);
+      if (err != GA_NO_ERROR) return err;
+    }
+  }
+
+  if (shared != 0) {
+    // the shared memory pointer must be the last argument
+    ctx->err = clSetKernelArg(k->k, k->argcount, shared, NULL);
+    if (ctx->err != CL_SUCCESS) return GA_IMPL_ERROR;
+  }
+
   evw = calloc(sizeof(cl_event), k->argcount);
   if (evw == NULL) {
     return GA_MEMORY_ERROR;
   }
 
+  num_ev = 0;
   for (i = 0; i < k->argcount; i++) {
-    switch (k->types[i]) {
-    case GA_POINTER:
-      free(evw);
-      return GA_DEVSUP_ERROR;
-    case GA_BUFFER:
-      btmp = (gpudata *)args[i];
-      if (btmp->ev != NULL)
-        evw[num_ev++] = btmp->ev;
-      ctx->err = clSetKernelArg(k->k, i, sizeof(cl_mem), &btmp->buf);
-      break;
-    case GA_SIZE:
-      temp = *((size_t *)args[i]);
-      ctx->err = clSetKernelArg(k->k, i, gpuarray_get_elsize(GA_ULONG), &temp);
-      break;
-    case GA_SSIZE:
-      stemp = *((ssize_t *)args[i]);
-      ctx->err = clSetKernelArg(k->k, i, gpuarray_get_elsize(GA_LONG), &stemp);
-      break;
-    default:
-      ctx->err = clSetKernelArg(k->k, i, gpuarray_get_elsize(k->types[i]),
-                                args[i]);
-    }
-    if (ctx->err != CL_SUCCESS) {
-      free(evw);
-      return GA_IMPL_ERROR;
+    if (k->evr[i] != NULL && *k->evr[i] != NULL) {
+      evw[num_ev++] = *k->evr[i];
     }
   }
 
@@ -932,15 +1057,15 @@ static int cl_callkernel(gpukernel *k, unsigned int n,
     _gs[0] = gs[0] * ls[0];
   }
   ctx->err = clEnqueueNDRangeKernel(ctx->q, k->k, n, NULL, _gs, ls,
-				    num_ev, evw, &ev);
+                                    num_ev, evw, &ev);
   free(evw);
   if (ctx->err != CL_SUCCESS) return GA_IMPL_ERROR;
 
   for (i = 0; i < k->argcount; i++) {
     if (k->types[i] == GA_BUFFER) {
-      if (((gpudata *)args[i])->ev != NULL)
-        clReleaseEvent(((gpudata *)args[i])->ev);
-      ((gpudata *)args[i])->ev = ev;
+      if (*k->evr[i] != NULL)
+        clReleaseEvent(*k->evr[i]);
+      *k->evr[i] = ev;
       clRetainEvent(ev);
     }
   }
@@ -995,135 +1120,18 @@ static int cl_sync(gpudata *b) {
   return GA_NO_ERROR;
 }
 
-static gpudata *cl_transfer(gpudata *buf, size_t offset, size_t sz,
-                            void *dst_ctx, int may_share) {
-  cl_ctx *ctx = buf->ctx;
+static int cl_transfer(gpudata *dst, size_t dstoff,
+                       gpudata *src, size_t srcoff, size_t sz) {
+  ASSERT_BUF(dst);
+  ASSERT_BUF(src);
 
-  ASSERT_BUF(buf);
-  ASSERT_CTX(ctx);
-  ASSERT_CTX((cl_ctx *)dst_ctx);
-
-  if (ctx == dst_ctx && may_share && offset == 0) {
-    cl_retain(buf);
-    return buf;
-  }
-  return NULL;
+  return GA_UNSUPPORTED_ERROR;
 }
 
-static const char ELEM_HEADER[] = "#define DTYPEA %s\n"
-  "#define DTYPEB %s\n"
-  "__kernel void elemk(__global const DTYPEA *a_data,"
-  "                    __global DTYPEB *b_data){"
-  "const int idx = get_global_id(0);"
-  "const int numThreads = get_global_size(0);"
-  "__global char *tmp; tmp = (__global char *)a_data; tmp += %" SPREFIX "u;"
-  "a_data = (__global const DTYPEA *)tmp; tmp = (__global char *)b_data;"
-  "tmp += %" SPREFIX "u; b_data = (__global DTYPEB *)tmp;"
-  "for (int i = idx; i < %" SPREFIX "u; i+= numThreads) {"
-  "__global const char *a_p = (__global const char *)a_data;"
-  "__global char *b_p = (__global char *)b_data;";
-
-static const char ELEM_FOOTER[] =
-  "__global const DTYPEA *a = (__global const DTYPEA *)a_p;"
-  "__global DTYPEB *b = (__global DTYPEB *)b_p;"
-  "b[0] = a[0];}}\n";
-
-static int cl_extcopy(gpudata *input, size_t ioff, gpudata *output,
-                      size_t ooff, int intype, int outtype, unsigned int a_nd,
-                      const size_t *a_dims, const ssize_t *a_str,
-                      unsigned int b_nd, const size_t *b_dims,
-                      const ssize_t *b_str) {
-  cl_ctx *ctx = input->ctx;
-  strb sb = STRB_STATIC_INIT;
-  size_t nEls, ls, gs;
-  gpukernel *k;
-  void *args[2];
-  cl_mem_flags fl;
-  int res = GA_SYS_ERROR;
-  unsigned int i;
-  int flags = GA_USE_CLUDA;
-  int types[2];
-
-  ASSERT_BUF(input);
-  ASSERT_BUF(output);
-  ASSERT_CTX(ctx);
-
-  if (input->ctx != output->ctx) return GA_VALUE_ERROR;
-
-  ctx->err = clGetMemObjectInfo(input->buf, CL_MEM_FLAGS, sizeof(fl), &fl,
-                                NULL);
-  if (ctx->err != CL_SUCCESS) return GA_IMPL_ERROR;
-  if (fl & CL_MEM_WRITE_ONLY) return GA_WRITEONLY_ERROR;
-
-  ctx->err = clGetMemObjectInfo(output->buf, CL_MEM_FLAGS, sizeof(fl), &fl,
-                                NULL);
-  if (ctx->err != CL_SUCCESS) return GA_IMPL_ERROR;
-  if (fl & CL_MEM_READ_ONLY) return GA_READONLY_ERROR;
-
-  nEls = 1;
-  for (i = 0; i < a_nd; i++) {
-    nEls *= a_dims[i];
-  }
-
-  if (nEls == 0) return GA_NO_ERROR;
-
-  if (outtype == GA_DOUBLE || intype == GA_DOUBLE ||
-      outtype == GA_CDOUBLE || intype == GA_CDOUBLE) {
-    flags |= GA_USE_DOUBLE;
-  }
-
-  if (outtype == GA_HALF || intype == GA_HALF) {
-    flags |= GA_USE_HALF;
-  }
-
-  if (gpuarray_get_elsize(outtype) < 4 || gpuarray_get_elsize(intype) < 4) {
-    /* Should check for non-mod4 strides too */
-    flags |= GA_USE_SMALL;
-  }
-
-  if (outtype == GA_CFLOAT || intype == GA_CFLOAT ||
-      outtype == GA_CDOUBLE || intype == GA_CDOUBLE) {
-    flags |= GA_USE_COMPLEX;
-  }
-
-  strb_appendf(&sb, ELEM_HEADER,
-	       gpuarray_get_type(intype)->cluda_name,
-	       gpuarray_get_type(outtype)->cluda_name,
-	       ioff, ooff, nEls);
-
-  gpuarray_elem_perdim(&sb, a_nd, a_dims, a_str, "a_p");
-  gpuarray_elem_perdim(&sb, b_nd, b_dims, b_str, "b_p");
-
-  strb_appends(&sb, ELEM_FOOTER);
-
-  if (strb_error(&sb))
-    goto fail;
-
-  types[0] = types[1] = GA_BUFFER;
-  k = cl_newkernel(ctx, 1, (const char **)&sb.s, &sb.l, "elemk",
-                   2, types, flags, &res, NULL);
-  if (k == NULL) goto fail;
-  /* Cheap kernel scheduling */
-  res = cl_property(NULL, NULL, k, GA_KERNEL_PROP_MAXLSIZE, &ls);
-  if (res != GA_NO_ERROR) goto kfail;
-
-  gs = ((nEls-1) / ls) + 1;
-  args[0] = input;
-  args[1] = output;
-  res = cl_callkernel(k, 1, &ls, &gs, 0, args);
-
- kfail:
-  cl_releasekernel(k);
- fail:
-  strb_clear(&sb);
-  return res;
-}
-
-#ifdef WITH_OPENCL_CLBLAS
 extern gpuarray_blas_ops clblas_ops;
-#endif
+extern gpuarray_blas_ops clblast_ops;
 
-static int cl_property(void *c, gpudata *buf, gpukernel *k, int prop_id,
+static int cl_property(gpucontext *c, gpudata *buf, gpukernel *k, int prop_id,
                        void *res) {
   cl_ctx *ctx = NULL;
   if (c != NULL) {
@@ -1136,12 +1144,11 @@ static int cl_property(void *c, gpudata *buf, gpukernel *k, int prop_id,
     ASSERT_KER(k);
     ctx = k->ctx;
   }
-  /* I know that 512 and 1024 are magic numbers.
-     There is an indication in buffer.h, though. */
-  if (prop_id < 512) {
+
+  if (prop_id < GA_BUFFER_PROP_START) {
     if (ctx == NULL)
       return GA_VALUE_ERROR;
-  } else if (prop_id < 1024) {
+  } else if (prop_id < GA_KERNEL_PROP_START) {
     if (buf == NULL)
       return GA_VALUE_ERROR;
   } else {
@@ -1174,6 +1181,11 @@ static int cl_property(void *c, gpudata *buf, gpukernel *k, int prop_id,
     }
     *((char **)res) = s;
     return GA_NO_ERROR;
+
+  case GA_CTX_PROP_PCIBUSID:
+    /* For the moment, PCI Bus ID is not supported for OpenCL. */
+    *((void **)res) = NULL;
+    return GA_DEVSUP_ERROR;
 
   case GA_CTX_PROP_MAXLSIZE:
     ctx->err = clGetContextInfo(ctx->ctx, CL_CONTEXT_DEVICES, sizeof(id),
@@ -1244,13 +1256,20 @@ static int cl_property(void *c, gpudata *buf, gpukernel *k, int prop_id,
     return GA_NO_ERROR;
 
   case GA_CTX_PROP_BLAS_OPS:
-#ifdef WITH_OPENCL_CLBLAS
-    *((gpuarray_blas_ops **)res) = &clblas_ops;
-    return GA_NO_ERROR;
-#else
+  {
+    int e;
+    if ((e = load_libclblas()) == GA_NO_ERROR)
+      *((gpuarray_blas_ops **)res) = &clblas_ops;
+    if ((e = load_libclblast()) == GA_NO_ERROR)
+      *((gpuarray_blas_ops **)res) = &clblast_ops;
+    return e;
+  }
+
+  case GA_CTX_PROP_COMM_OPS:
+    // TODO Complete in the future whenif a multi-gpu collectives API for
+    // opencl appears
     *((void **)res) = NULL;
     return GA_DEVSUP_ERROR;
-#endif
 
   case GA_CTX_PROP_BIN_ID:
     *((const char **)res) = ctx->bin_id;
@@ -1258,6 +1277,117 @@ static int cl_property(void *c, gpudata *buf, gpukernel *k, int prop_id,
 
   case GA_CTX_PROP_ERRBUF:
     *((gpudata **)res) = ctx->errbuf;
+    return GA_NO_ERROR;
+
+  case GA_CTX_PROP_TOTAL_GMEM:
+    ctx->err = clGetContextInfo(ctx->ctx, CL_CONTEXT_DEVICES, sizeof(id), &id,
+                                NULL);
+    if (ctx->err != GA_NO_ERROR)
+      return GA_IMPL_ERROR;
+    ctx->err = clGetDeviceInfo(id, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(sz), &sz,
+                               NULL);
+    if (ctx->err != GA_NO_ERROR)
+      return GA_IMPL_ERROR;
+    *((size_t *)res) = sz;
+    return GA_NO_ERROR;
+
+  case GA_CTX_PROP_FREE_GMEM:
+    ctx->err = clGetContextInfo(ctx->ctx, CL_CONTEXT_DEVICES, sizeof(id), &id,
+                                NULL);
+    if (ctx->err != GA_NO_ERROR)
+      return GA_IMPL_ERROR;
+    /* XXX: This is not exaclty the amount of free memory but there is
+       no way to query that in the OpenCL API. */
+    ctx->err = clGetDeviceInfo(id, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(sz),
+                               &sz, NULL);
+    if (ctx->err != GA_NO_ERROR)
+      return GA_IMPL_ERROR;
+    *((size_t *)res) = sz;
+    return GA_NO_ERROR;
+
+  case GA_CTX_PROP_NATIVE_FLOAT16:
+    *((int *)res) = 0;
+    return GA_NO_ERROR;
+
+  case GA_CTX_PROP_MAXGSIZE0:
+    /* It might be bigger than that, but it's not readily available
+       information. */
+    *((size_t *)res) = (1>>31) - 1;
+    return GA_NO_ERROR;
+
+  case GA_CTX_PROP_MAXGSIZE1:
+    /* It might be bigger than that, but it's not readily available
+       information. */
+    *((size_t *)res) = (1>>31) - 1;
+    return GA_NO_ERROR;
+
+  case GA_CTX_PROP_MAXGSIZE2:
+    /* It might be bigger than that, but it's not readily available
+       information. */
+    *((size_t *)res) = (1>>31) - 1;
+    return GA_NO_ERROR;
+
+  case GA_CTX_PROP_MAXLSIZE0:
+    ctx->err = clGetContextInfo(ctx->ctx, CL_CONTEXT_DEVICES, sizeof(id),
+                                &id, NULL);
+    if (ctx->err != CL_SUCCESS)
+      return GA_IMPL_ERROR;
+    ctx->err = clGetDeviceInfo(id, CL_DEVICE_MAX_WORK_ITEM_SIZES, 0, NULL,
+                               &sz);
+    if (ctx->err != CL_SUCCESS)
+      return GA_IMPL_ERROR;
+    psz = malloc(sz);
+    if (psz == NULL)
+      return GA_MEMORY_ERROR;
+    ctx->err = clGetDeviceInfo(id, CL_DEVICE_MAX_WORK_ITEM_SIZES, sz, psz, NULL);
+    if (ctx->err != CL_SUCCESS) {
+      free(psz);
+      return GA_IMPL_ERROR;
+    }
+    *((size_t *)res) = psz[0];
+    free(psz);
+    return GA_NO_ERROR;
+
+  case GA_CTX_PROP_MAXLSIZE1:
+    ctx->err = clGetContextInfo(ctx->ctx, CL_CONTEXT_DEVICES, sizeof(id),
+                                &id, NULL);
+    if (ctx->err != CL_SUCCESS)
+      return GA_IMPL_ERROR;
+    ctx->err = clGetDeviceInfo(id, CL_DEVICE_MAX_WORK_ITEM_SIZES, 0, NULL,
+                               &sz);
+    if (ctx->err != CL_SUCCESS)
+      return GA_IMPL_ERROR;
+    psz = malloc(sz);
+    if (psz == NULL)
+      return GA_MEMORY_ERROR;
+    ctx->err = clGetDeviceInfo(id, CL_DEVICE_MAX_WORK_ITEM_SIZES, sz, psz, NULL);
+    if (ctx->err != CL_SUCCESS) {
+      free(psz);
+      return GA_IMPL_ERROR;
+    }
+    *((size_t *)res) = psz[1];
+    free(psz);
+    return GA_NO_ERROR;
+
+  case GA_CTX_PROP_MAXLSIZE2:
+    ctx->err = clGetContextInfo(ctx->ctx, CL_CONTEXT_DEVICES, sizeof(id),
+                                &id, NULL);
+    if (ctx->err != CL_SUCCESS)
+      return GA_IMPL_ERROR;
+    ctx->err = clGetDeviceInfo(id, CL_DEVICE_MAX_WORK_ITEM_SIZES, 0, NULL,
+                               &sz);
+    if (ctx->err != CL_SUCCESS)
+      return GA_IMPL_ERROR;
+    psz = malloc(sz);
+    if (psz == NULL)
+      return GA_MEMORY_ERROR;
+    ctx->err = clGetDeviceInfo(id, CL_DEVICE_MAX_WORK_ITEM_SIZES, sz, psz, NULL);
+    if (ctx->err != CL_SUCCESS) {
+      free(psz);
+      return GA_IMPL_ERROR;
+    }
+    *((size_t *)res) = psz[2];
+    free(psz);
     return GA_NO_ERROR;
 
   case GA_BUFFER_PROP_REFCNT:
@@ -1275,7 +1405,7 @@ static int cl_property(void *c, gpudata *buf, gpukernel *k, int prop_id,
   /* GA_BUFFER_PROP_CTX is not ordered to simplify code */
   case GA_BUFFER_PROP_CTX:
   case GA_KERNEL_PROP_CTX:
-    *((void **)res) = (void *)ctx;
+    *((gpucontext **)res) = (gpucontext *)ctx;
     return GA_NO_ERROR;
 
   case GA_KERNEL_PROP_MAXLSIZE:
@@ -1295,27 +1425,11 @@ static int cl_property(void *c, gpudata *buf, gpukernel *k, int prop_id,
                                 &id, NULL);
     if (ctx->err != GA_NO_ERROR)
       return GA_IMPL_ERROR;
-#ifdef CL_VERSION_1_1
     ctx->err = clGetKernelWorkGroupInfo(k->k, id,
-                                CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE,
-                                        sizeof(sz), &sz, NULL);
+                                        CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE,
+                                         sizeof(sz), &sz, NULL);
     if (ctx->err != GA_NO_ERROR)
       return GA_IMPL_ERROR;
-#else
-    ctx->err = clGetKernelWorkGroupInfo(k->k, id, CL_KERNEL_WORK_GROUP_SIZE,
-                                        sizeof(sz), &sz, NULL);
-    if (ctx->err != GA_NO_ERROR)
-      return GA_IMPL_ERROR;
-    /*
-      This is sort of a guess, AMD generally has 64 and NVIDIA has 32.
-      Since this is a multiple, it would not hurt a lot to overestimate
-      unless we go over the maximum. However underestimating may hurt
-      performance due to the way we do the automatic allocation.
-
-      Also OpenCL 1.0 kind of sucks and this is only used for that.
-    */
-    sz = (sz < 64) ? sz : 64;
-#endif
     *((size_t *)res) = sz;
     return GA_NO_ERROR;
 
@@ -1332,33 +1446,36 @@ static int cl_property(void *c, gpudata *buf, gpukernel *k, int prop_id,
   }
 }
 
-static const char *cl_error(void *c) {
+static const char *cl_error(gpucontext *c) {
   cl_ctx *ctx = (cl_ctx *)c;
-  if (ctx == NULL)
+  if (ctx == NULL){
     return get_error_string(err);
-  else
+  }else{
     ASSERT_CTX(ctx);
     return get_error_string(ctx->err);
+  }
 }
 
 GPUARRAY_LOCAL
-const gpuarray_buffer_ops opencl_ops = {cl_init,
-                                       cl_deinit,
-                                       cl_alloc,
-                                       cl_retain,
-                                       cl_release,
-                                       cl_share,
-                                       cl_move,
-                                       cl_read,
-                                       cl_write,
-                                       cl_memset,
-                                       cl_newkernel,
-                                       cl_retainkernel,
-                                       cl_releasekernel,
-                                       cl_callkernel,
-                                       cl_kernelbin,
-                                       cl_sync,
-                                       cl_extcopy,
-                                       cl_transfer,
-                                       cl_property,
-                                       cl_error};
+const gpuarray_buffer_ops opencl_ops = {cl_get_platform_count,
+                                        cl_get_device_count,
+                                        cl_init,
+                                        cl_deinit,
+                                        cl_alloc,
+                                        cl_retain,
+                                        cl_release,
+                                        cl_share,
+                                        cl_move,
+                                        cl_read,
+                                        cl_write,
+                                        cl_memset,
+                                        cl_newkernel,
+                                        cl_retainkernel,
+                                        cl_releasekernel,
+                                        cl_setkernelarg,
+                                        cl_callkernel,
+                                        cl_kernelbin,
+                                        cl_sync,
+                                        cl_transfer,
+                                        cl_property,
+                                        cl_error};

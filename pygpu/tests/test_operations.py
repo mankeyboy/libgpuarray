@@ -1,7 +1,7 @@
 import numpy
 import pygpu
 
-from .support import (gen_gpuarray, context)
+from .support import (gen_gpuarray, context, SkipTest)
 
 
 def test_array_split():
@@ -13,17 +13,30 @@ def test_array_split():
     for pc, pg in zip(rc, rg):
         numpy.testing.assert_allclose(pc, numpy.asarray(pg))
 
+    xc, xg = gen_gpuarray((8,), 'float32', ctx=context)
+    rc = numpy.array_split(xc, 3, axis=-1)
+    rg = pygpu.array_split(xg, 3, axis=-1)
+
+    assert len(rc) == len(rg)
+    for pc, pg in zip(rc, rg):
+        numpy.testing.assert_allclose(pc, numpy.asarray(pg))
+
+
 def test_split():
     for spl in (3, [3, 5, 6, 10]):
         yield xsplit, '', (9,), spl
 
+
 def test_xsplit():
+    if tuple(int(v) for v in numpy.version.version.split('.')[:2]) < (1, 11):
+        raise SkipTest("Numpy version too old")
     for l in ('h', 'v'):
         for spl in (2, [3, 6]):
             yield xsplit, l, (4, 4), spl
         yield xsplit, l, (2, 2, 2), 2
     for spl in (2, [3, 6]):
         yield xsplit, 'd', (2, 2, 4), spl
+
 
 def xsplit(l, shp, spl):
     xc, xg = gen_gpuarray(shp, 'float32', ctx=context)
@@ -47,6 +60,11 @@ def test_concatenate():
 
     rc = numpy.concatenate((ac, bc.T), axis=1)
     rg = pygpu.concatenate((ag, bg.T), axis=1)
+
+    numpy.testing.assert_allclose(rc, numpy.asarray(rg))
+
+    rc = numpy.concatenate((ac, bc.T), axis=-1)
+    rg = pygpu.concatenate((ag, bg.T), axis=-1)
 
     numpy.testing.assert_allclose(rc, numpy.asarray(rg))
 

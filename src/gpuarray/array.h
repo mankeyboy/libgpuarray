@@ -8,7 +8,9 @@
 #include <gpuarray/buffer.h>
 
 #ifdef _MSC_VER
-#define inline
+#ifndef inline
+#define inline __inline
+#endif
 #endif
 
 #ifdef __cplusplus
@@ -26,10 +28,6 @@ typedef struct _GpuArray {
    * Device data buffer.
    */
   gpudata *data;
-  /**
-   * Backend operations vector.
-   */
-  const gpuarray_buffer_ops *ops;
   /**
    * Size of each dimension.  The number of elements is #nd.
    */
@@ -199,11 +197,17 @@ static inline int GpuArray_CHKFLAGS(const GpuArray *a, int flags) {
 #define GpuArray_ITEMSIZE(a) gpuarray_get_elsize((a)->typecode)
 
 /**
+ * Fix the flags of an array using the current strides and shape.
+ *
+ * \param a GpuArray to fix flags for
+ */
+GPUARRAY_PUBLIC void GpuArray_fix_flags(GpuArray *a);
+
+/**
  * Initialize and allocate a new empty (uninitialized data) array.
  *
  * \param a the GpuArray structure to initialize.  Content will be
  * ignored so make sure to deallocate any previous array first.
- * \param ops backend operations to use.
  * \param ctx context in which to allocate array data. Must come from
  * the same backend as the operations vector.
  * \param typecode type of the elements in the array
@@ -216,16 +220,15 @@ static inline int GpuArray_CHKFLAGS(const GpuArray *a, int flags) {
  * the device.  Any other error code means that the structure is
  * left uninitialized.
  */
-GPUARRAY_PUBLIC int GpuArray_empty(GpuArray *a, const gpuarray_buffer_ops *ops,
-                                  void *ctx, int typecode, unsigned int nd,
-                                  const size_t *dims, ga_order ord);
+GPUARRAY_PUBLIC int GpuArray_empty(GpuArray *a, gpucontext *ctx, int typecode,
+                                   unsigned int nd, const size_t *dims,
+                                   ga_order ord);
 
 /**
  * Initialize and allocate a new zero-initialized array.
  *
  * \param a the GpuArray structure to initialize.  Content will be
  * ignored so make sure to deallocate any previous array first.
- * \param ops backend operations to use.
  * \param ctx context in which to allocate array data. Must come from
  * the same backend as the operations vector.
  * \param typecode type of the elements in the array
@@ -238,9 +241,9 @@ GPUARRAY_PUBLIC int GpuArray_empty(GpuArray *a, const gpuarray_buffer_ops *ops,
  * the device.  Any other error code means that the structure is
  * left uninitialized.
  */
-GPUARRAY_PUBLIC int GpuArray_zeros(GpuArray *a, const gpuarray_buffer_ops *ops,
-                                  void *ctx, int typecode, unsigned int nd,
-                                  const size_t *dims, ga_order ord);
+GPUARRAY_PUBLIC int GpuArray_zeros(GpuArray *a, gpucontext *ctx, int typecode,
+                                   unsigned int nd, const size_t *dims,
+                                   ga_order ord);
 
 /**
  * Initialize and allocate a new array structure from a pre-existing buffer.
@@ -248,10 +251,10 @@ GPUARRAY_PUBLIC int GpuArray_zeros(GpuArray *a, const gpuarray_buffer_ops *ops,
  * The array will be considered to own the gpudata structure after the
  * call is made and will free it when deallocated.  An error return
  * from this function will deallocate `data`.
+ * This increment the ref count of gpudata. This seem to contradict the above.
  *
  * \param a the GpuArray structure to initialize.  Content will be
  * ignored so make sure to deallocate any previous array first.
- * \param ops backend that corresponds to the buffer.
  * \param data buffer to user.
  * \param offset position of the first data element of the array in the buffer.
  * \param typecode type of the elements in the array
@@ -265,17 +268,15 @@ GPUARRAY_PUBLIC int GpuArray_zeros(GpuArray *a, const gpuarray_buffer_ops *ops,
  * is left uninitialized and the provided buffer is deallocated.
  */
 GPUARRAY_PUBLIC int GpuArray_fromdata(GpuArray *a,
-                                     const gpuarray_buffer_ops *ops,
-                                     gpudata *data, size_t offset,
-                                     int typecode, unsigned int nd,
-                                     const size_t *dims,
-                                     const ssize_t *strides, int writeable);
+                                      gpudata *data, size_t offset,
+                                      int typecode, unsigned int nd,
+                                      const size_t *dims,
+                                      const ssize_t *strides, int writeable);
 
 GPUARRAY_PUBLIC int GpuArray_copy_from_host(GpuArray *a,
-                                           const gpuarray_buffer_ops *ops,
-                                           void *ctx, void *buf, int typecode,
-                                           unsigned int nd, const size_t *dims,
-                                           const ssize_t *strides);
+                                            gpucontext *ctx, void *buf, int typecode,
+                                            unsigned int nd, const size_t *dims,
+                                            const ssize_t *strides);
 
 /**
  * Initialize an array structure to provide a view of another.
@@ -430,7 +431,7 @@ GPUARRAY_PUBLIC int GpuArray_transpose_inplace(GpuArray *a,
                                               const unsigned int *new_axes);
 
 /**
- * Relase all device and host memory associated with `a`.
+ * Release all device and host memory associated with `a`.
  *
  * This function frees all host memory, and releases the device memory
  * if it is the owner. In case an array has views it is the
@@ -461,10 +462,10 @@ GPUARRAY_PUBLIC int GpuArray_share(const GpuArray *a, const GpuArray *b);
  *
  * \returns the context in which `a` was allocated.
  */
-GPUARRAY_PUBLIC void *GpuArray_context(const GpuArray *a);
+GPUARRAY_PUBLIC gpucontext *GpuArray_context(const GpuArray *a);
 
 /**
- * Copies all the elements of and array to another.
+ * Copies all the elements of one array to another.
  *
  * The arrays `src` and `dst` must have the same size (total number of
  * elements) and be in the same context.
@@ -488,7 +489,7 @@ GPUARRAY_PUBLIC int GpuArray_move(GpuArray *dst, const GpuArray *src);
  * \return an error code otherwise
  */
 GPUARRAY_PUBLIC int GpuArray_write(GpuArray *dst, const void *src,
-                                  size_t src_sz);
+                                   size_t src_sz);
 
 /**
  * Copy data from the device memory to the host memory.
@@ -527,27 +528,21 @@ GPUARRAY_PUBLIC int GpuArray_copy(GpuArray *res, const GpuArray *a,
                                  ga_order order);
 
 /**
- * Transfer an array to a different context.
+ * Copy between arrays in different contexts.
  *
- * The device data is copied to the new device and an new GpuArray is
- * allocated to refer to this new data.  If the `may_share` parameter
- * is 1 the data on the new device may be a view of the old (but this
- * might not be possible so you should not count on it).
+ * This works like GpuArray_move() except it will work between arrays
+ * that aren't in the same context.
  *
- * \param res result array
+ * Source and target arrays must be contiguous.  This restriction may
+ * be lifted in the future.
+ *
+ * \param r result array
  * \param a array to transfer
- * \param new_ctx destination context
- * \param new_ops ops vector for the destination context
- * \param may_share indicate that the result array may share data with
- *                  the source
  *
  * \return GA_NO_ERROR if the operation was succesful.
  * \return an error code otherwise
  */
-GPUARRAY_PUBLIC int GpuArray_transfer(GpuArray *res, const GpuArray *a,
-                                     void *new_ctx,
-                                     const gpuarray_buffer_ops *new_ops,
-                                     int may_share);
+GPUARRAY_PUBLIC int GpuArray_transfer(GpuArray *res, const GpuArray *a);
 
 /**
  * Split an array into multiple views.
@@ -618,6 +613,45 @@ GPUARRAY_PUBLIC const char *GpuArray_error(const GpuArray *a, int err);
 GPUARRAY_PUBLIC void GpuArray_fprintf(FILE *fd, const GpuArray *a);
 
 GPUARRAY_PUBLIC int GpuArray_fdump(FILE *fd, const GpuArray *a);
+
+/**
+ * @brief Computes simultaneously the maxima and the arguments of maxima over
+ * specified axes of the tensor.
+ *
+ * Returns two tensors of identical shape. Both tensors' axes are a subset of
+ * the axes of the original tensor. The axes to be reduced are specified by
+ * the caller, and the maxima and arguments of maxima are computed over them.
+ *
+ * @param [out] dstMax     The resulting tensor of maxima
+ * @param [out] dstArgmax  the resulting tensor of arguments at maxima
+ * @param [in]  src        The source tensor.
+ * @param [in]  reduxLen   The number of axes reduced. Must be >= 1 and
+ *                         <= src->nd.
+ * @param [in]  reduxList  A list of integers of length reduxLen, indicating
+ *                         the axes to be reduced. The order of the axes
+ *                         matters for dstArgmax index calculations. All
+ *                         entries in the list must be unique, >= 0 and
+ *                         < src->nd.
+ *                         
+ *                         For example, if a 5D-tensor is reduced with an axis
+ *                         list of [3,4,1], then reduxLen shall be 3, and the
+ *                         index calculation in every point shall take the form
+ *                         
+ *                             dstArgmax[i0,i2] = i3 * src.shape[4] * src.shape[1] +
+ *                                                i4 * src.shape[1]                +
+ *                                                i1
+ *                         
+ *                         where (i3,i4,i1) are the coordinates of the maximum-
+ *                         valued element within subtensor [i0,:,i2,:,:] of src.
+ * @return GA_NO_ERROR if the operation was successful, or a non-zero error
+ *         code otherwise.
+ */
+
+GPUARRAY_PUBLIC int GpuArray_maxandargmax(GpuArray*       dstMax,
+                                          GpuArray*       dstArgmax,
+                                          const GpuArray* src,
+                                          unsigned        reduxLen,
+                                          const unsigned* reduxList);
 
 #ifdef __cplusplus
 }

@@ -8,11 +8,12 @@ import pickle
 
 import numpy
 
+from nose.tools import assert_raises
 import pygpu
 from pygpu.gpuarray import GpuArray, GpuContext, GpuKernel
 
 from .support import (guard_devsup, check_meta, check_flags, check_all,
-                      gen_gpuarray, context as ctx, dtypes_all,
+                      check_content, gen_gpuarray, context as ctx, dtypes_all,
                       dtypes_no_complex, skip_single_f)
 
 
@@ -303,6 +304,61 @@ def mapping_setitem_ellipsis2(shp, dtype, offseted):
     a_gpu[:] = b_gpu
     assert numpy.allclose(a, numpy.asarray(b_gpu))
 
+class WriteReadTest(unittest.TestCase):
+    def setUp(self):
+        self.cpu, self.gpu = gen_gpuarray((3, 4, 5), ctx=ctx)
+        self.cpu[0, 0, 0] = 80
+
+    def test_write(self):
+        self.gpu.write(self.cpu)
+        res = numpy.asarray(self.gpu)
+        assert numpy.allclose(self.cpu, res)
+
+        self.cpu[0, 0, 0] = 160
+        self.cpu.setflags(write=False)
+        self.gpu.write(self.cpu)
+        res = numpy.asarray(self.gpu)
+        assert numpy.allclose(self.cpu, res)
+
+        self.cpu = numpy.ndarray((2, 4, 5), dtype="float32", order='C')
+        self.assertRaises(ValueError, self.gpu.write, self.cpu)
+        self.cpu = numpy.ndarray((3, 4, 5), dtype="float64", order='C')
+        self.assertRaises(ValueError, self.gpu.write, self.cpu)
+
+        cpu2 = numpy.random.random((3, 4, 5))
+        cpu2 = numpy.asarray(cpu2, dtype='float32', order='F')
+        self.gpu.write(cpu2)
+        res = numpy.asarray(self.gpu)
+        assert numpy.allclose(cpu2, res)
+
+        cpu2 = numpy.random.random((3, 4, 2, 5))
+        cpu2 = numpy.asarray(cpu2, dtype='float32', order='C')
+        self.gpu.write(cpu2[:, :, 0, :])
+        res = numpy.asarray(self.gpu)
+        assert numpy.allclose(cpu2[:, :, 0, :], res)
+
+        cpu2 = numpy.random.random((3, 4, 2, 5))
+        cpu2 = numpy.asarray(cpu2, dtype='float32', order='F')
+        self.gpu.write(cpu2[:, :, 0, :])
+        res = numpy.asarray(self.gpu)
+        assert numpy.allclose(cpu2[:, :, 0, :], res)
+
+    def test_read(self):
+        self.gpu.read(self.cpu)
+        res = numpy.asarray(self.gpu)
+        assert numpy.allclose(self.cpu, res)
+
+        self.cpu = numpy.ndarray((3, 4, 5), dtype="float32", order='C')
+        self.cpu.setflags(write=False)
+        self.assertRaises(ValueError, self.gpu.read, self.cpu)
+        self.cpu = numpy.ndarray((2, 4, 5), dtype="float32", order='C')
+        self.assertRaises(ValueError, self.gpu.read, self.cpu)
+        self.cpu = numpy.ndarray((3, 4, 5), dtype="float64", order='C')
+        self.assertRaises(ValueError, self.gpu.read, self.cpu)
+        self.cpu = numpy.ndarray((3, 4, 5), dtype="float32", order='F')
+        self.assertRaises(ValueError, self.gpu.read, self.cpu)
+        self.cpu = numpy.ndarray((3, 4, 2, 5), dtype="float32", order='C')
+        self.assertRaises(ValueError, self.gpu.read, self.cpu[:, :, 0, :])
 
 def test_copy_view():
     for shp in [(5,), (6, 7), (4, 8, 9), (1, 8, 9)]:
@@ -391,6 +447,32 @@ def reshape(shps, offseted, order1, order2):
     assert outc.shape == outg.shape
     assert outc.strides == outg.strides
     assert numpy.allclose(outc, numpy.asarray(outg))
+
+
+def test_strides():
+    yield strides_, (4, 4), 'c', 1, (4, 4)
+    yield strides_, (4, 4), 'c', 1, (4, 16)
+    yield strides_, (4, 4), 'c', 1, (16, 4)
+    yield strides_, (4, 4), 'c', 1, (16, 8)
+    yield strides_, (4, 4), 'c', 1, (16, 0)
+    yield strides_, (4, 4), 'c', -1, (-20, 4)
+    yield strides_, (4, 4), 'c', -1, (-12, 4)
+
+
+def set_strides(a, newstr):
+    a.strides = newstr
+
+
+def strides_(shp, order, sliced, newstr):
+    ac, ag = gen_gpuarray(shp, 'float32', sliced=sliced, order=order, ctx=ctx)
+    try:
+        ac.strides = newstr
+    except ValueError:
+        assert_raises(ValueError, set_strides, ag, newstr)
+        return
+    ag.strides = newstr
+    check_flags(ag, ac)
+    assert numpy.allclose(ac, numpy.asarray(ag))
 
 
 def test_transpose():
@@ -606,6 +688,24 @@ def _cmpfV(x, *y):
         pass
     else:
         raise Exception("Did not generate value error")
+
+
+def test_take1():
+    yield do_take1, (4, 3), [2, 0], False
+    yield do_take1, (4, 3), [2, 0], True
+    yield do_take1, (12, 4, 3), [1, 1, 1, 1, 1, 2, 2, 3, 3, 0, 0, 9], False
+
+
+def do_take1(shp, idx, offseted):
+    c, g = gen_gpuarray(shp, dtype='float32', ctx=ctx, order='c')
+    ci = numpy.asarray(idx)
+    gi = pygpu.asarray(ci, context=ctx)
+
+    rc = c.take(ci, axis=0)
+    rg = g.take1(gi)
+
+    check_content(rg, rc)
+
 
 def test_flags():
     for fl in ['C', 'F', 'W', 'B', 'O', 'A', 'U', 'CA', 'FA', 'FNC', 'FORC',

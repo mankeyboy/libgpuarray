@@ -1,19 +1,18 @@
 #include <assert.h>
 
 #include "private.h"
+#include "util/strb.h"
+
 #include "gpuarray/util.h"
 #include "gpuarray/error.h"
 #include "gpuarray/kernel.h"
-#include "util/strb.h"
+#include "gpuarray/elemwise.h"
 
 /*
  * API version is negative since we are still in the development
  * phase. Once we go stable, this will move to 0 and go up from
  * there.
  */
-const int gpuarray_api_major = -10000;
-const int gpuarray_api_minor = 0;
-
 static gpuarray_type **custom_types = NULL;
 static int n_types = 0;
 static gpuarray_type no_type = {NULL, 0, 0, -1};
@@ -109,6 +108,19 @@ void gpukernel_source_with_line_numbers(unsigned int count,
   }
 }
 
+static int get_type_flags(int typecode) {
+  int flags = 0;
+  if (typecode == GA_DOUBLE || typecode == GA_CDOUBLE)
+    flags |= GA_USE_DOUBLE;
+  if (typecode == GA_HALF)
+    flags |= GA_USE_HALF;
+  if (typecode == GA_CFLOAT || typecode == GA_CDOUBLE)
+    flags |= GA_USE_COMPLEX;
+  if (gpuarray_get_elsize(typecode) < 4)
+    flags |= GA_USE_SMALL;
+  return flags;
+}
+
 /* List of typecodes terminated by -1 */
 int gpuarray_type_flags(int init, ...) {
   va_list ap;
@@ -117,16 +129,60 @@ int gpuarray_type_flags(int init, ...) {
 
   va_start(ap, init);
   while (typecode != -1) {
-    if (typecode == GA_DOUBLE || typecode == GA_CDOUBLE)
-      flags |= GA_USE_DOUBLE;
-    if (typecode == GA_HALF)
-      flags |= GA_USE_HALF;
-    if (typecode == GA_CFLOAT || typecode == GA_CDOUBLE)
-      flags |= GA_USE_COMPLEX;
-    if (gpuarray_get_elsize(typecode) < 4)
-      flags |= GA_USE_SMALL;
+    flags |= get_type_flags(typecode);
     typecode = va_arg(ap, int);
   }
   va_end(ap);
   return flags;
+}
+
+int gpuarray_type_flagsa(unsigned int n, gpuelemwise_arg *args) {
+  unsigned int i;
+  int flags = 0;
+  for (i = 0; i < n; i++) {
+    flags |= get_type_flags(args[i].typecode);
+  }
+  return flags;
+}
+
+static inline void shiftdown(ssize_t *base, unsigned int i, unsigned int nd) {
+  if (base != NULL)
+    memmove(&base[i], &base[i+1], (nd - i - 1)*sizeof(size_t));
+}
+
+void gpuarray_elemwise_collapse(unsigned int n, unsigned int *_nd,
+                                size_t *dims, ssize_t **strs) {
+  unsigned int i;
+  unsigned int k;
+  unsigned int nd = *_nd;
+
+  /* Remove dimensions of size 1 */
+  for (i = nd; i > 0; i--) {
+    if (nd > 1 && dims[i-1] == 1) {
+      shiftdown((ssize_t *)dims, i-1, nd);
+      for (k = 0; k < n; k++)
+        shiftdown(strs[k], i-1, nd);
+      nd--;
+    }
+  }
+
+  for (i = nd - 1; i > 0; i--) {
+    int collapse = 1;
+    for (k = 0; k < n; k++) {
+      collapse &= (strs[k] == NULL ||
+                   strs[k][i - 1] == (ssize_t)dims[i] * strs[k][i]);
+    }
+    if (collapse) {
+      dims[i-1] *= dims[i];
+      shiftdown((ssize_t *)dims, i, nd);
+      for (k = 0; k < n; k++) {
+        if (strs[k] != NULL) {
+          strs[k][i-1] = strs[k][i];
+          shiftdown(strs[k], i, nd);
+        }
+      }
+      nd--;
+    }
+  }
+  *_nd = nd;
 }

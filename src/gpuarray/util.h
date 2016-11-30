@@ -12,10 +12,8 @@ extern "C" {
 #endif
 
 #include <gpuarray/config.h>
+#include <gpuarray/elemwise.h>
 #include <gpuarray/types.h>
-
-extern GPUARRAY_PUBLIC const int gpuarray_api_major;
-extern GPUARRAY_PUBLIC const int gpuarray_api_minor;
 
 /**
  * Registers a type with the kernel machinery.
@@ -74,6 +72,31 @@ GPUARRAY_PUBLIC size_t gpuarray_get_elsize(int typecode);
  * \returns flags for all passed-in types.
  */
 GPUARRAY_PUBLIC int gpuarray_type_flags(int init, ...);
+
+GPUARRAY_PUBLIC int gpuarray_type_flagsa(unsigned int n, gpuelemwise_arg *arg);
+
+/**
+ * Perform dimension collapsing on the specified arguments.
+ *
+ * This function will check for dimension that are next to each other
+ * and contiguous for all inputs and merge them together. This allows
+ * to reduce the complexity of the indexing code in kernels and
+ * therefore enables faster runtime for kernels.
+ *
+ * On return the nd, dims and strs will be overwritten with the
+ * collapsed versions.
+ *
+ * For scalar arguments, strs[k] can be NULL.
+ *
+ * \param n The number of arguments
+ * \param nd The number of dimensions of all arguments
+ * \param dim The compute shape
+ * \param strs The strides for all arguments
+ *
+ */
+GPUARRAY_PUBLIC void gpuarray_elemwise_collapse(unsigned int n,
+                                                unsigned int *nd,
+                                                size_t *dim, ssize_t **strs);
 
 #ifdef __cplusplus
 }

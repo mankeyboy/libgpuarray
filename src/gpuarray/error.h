@@ -32,6 +32,10 @@ enum ga_error {
   GA_UNALIGNED_ERROR,
   GA_COPY_ERROR,
   GA_NODEV_ERROR,
+  GA_MISC_ERROR,
+  GA_COMM_ERROR,
+  GA_XLARGE_ERROR,
+  GA_LOAD_ERROR,
   /* Add more error types if needed, but at the end */
   /* Don't forget to sync with Gpu_error() */
 };
